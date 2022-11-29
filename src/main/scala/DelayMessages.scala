@@ -9,7 +9,7 @@ import org.apache.kafka.streams.{KeyValue, StreamsBuilder, Topology}
 import org.apache.kafka.streams.kstream.{Consumed, EmitStrategy, KStream, KTable, Materialized, Produced, SessionWindows, Suppressed, TimeWindows, Windows}
 import org.apache.kafka.streams.processor.{PunctuationType, RecordContext, To, api}
 import org.apache.kafka.streams.processor.api.{Processor, ProcessorContext}
-import org.apache.kafka.streams.state.{Stores, TimestampedWindowStore, WindowStore}
+import org.apache.kafka.streams.state.{Stores, TimestampedKeyValueStore, TimestampedWindowStore, ValueAndTimestamp, WindowStore}
 import org.apache.kafka.streams.processor.api.Record
 import org.apache.kafka.streams.state.internals.WindowStoreBuilder
 
@@ -24,22 +24,9 @@ case class DelayMessages(delay: FiniteDuration, originTopic: String, destTopic: 
   private val serde = Serdes.BytesSerde()
 
   def buildTopology(builder: StreamsBuilder): Topology =
-//    builder
-//      .stream(originTopic, Consumed.`with`(serde, serde))
-//      .groupByKey
-//      .windowedBy(
-//        TimeWindows
-//          .ofSizeAndGrace(delay.toJava, java.time.Duration.ZERO)
-//          .advanceBy(100.millisecond.toJava)
-//      )
-//      .reduce((_, last) => last)
-//      .suppress(Suppressed.untilWindowCloses(unbounded()))
-//      .toStream
-//      .map((windowedKey, value) => KeyValue(windowedKey.key, value))
-//      .to(destTopic, Produced.`with`(serde, serde))
       builder
-        .addStateStore(Stores.windowStoreBuilder(
-          Stores.persistentWindowStore(DelayRecordProcessor.StoreName, (delay * 10).toJava, delay.toJava, false),
+        .addStateStore(Stores.timestampedKeyValueStoreBuilder(
+          Stores.inMemoryKeyValueStore(DelayRecordProcessor.StoreName),
           serde,
           serde
         ))
@@ -49,27 +36,30 @@ case class DelayMessages(delay: FiniteDuration, originTopic: String, destTopic: 
 
       builder.build()
 
-case class DelayRecordProcessor(delay: Duration) extends Processor[Bytes, Bytes, Bytes, Bytes]:
+case class DelayRecordProcessor(delay: FiniteDuration) extends Processor[Bytes, Bytes, Bytes, Bytes]:
 
-  private var store: WindowStore[Bytes, Bytes] = _
+  private var store: TimestampedKeyValueStore[Bytes, Bytes] = _
 
   override def init(context: ProcessorContext[Bytes, Bytes]): Unit =
-    store = context.getStateStore(DelayRecordProcessor.StoreName).asInstanceOf[WindowStore[Bytes, Bytes]]
-    context.schedule(java.time.Duration.ofMillis(10), PunctuationType.WALL_CLOCK_TIME, _timestamp => {
-      val now = Instant.now
-      val from = Instant.now.minusMillis(delay.toMillis)
-      val eligible = store.fetchAll(from, now).asScala
-      eligible.foreach(result => {
-        val key: Bytes = result.key.key()
-        val value: Bytes = result.value
-        context.forward(new Record(key, value, now.toEpochMilli)) // FIXME: what about headers?
-      })
+    store = context.getStateStore(DelayRecordProcessor.StoreName).asInstanceOf[TimestampedKeyValueStore[Bytes, Bytes]]
+    context.schedule(java.time.Duration.ofMillis(10), PunctuationType.WALL_CLOCK_TIME, timestamp => {
+      val threshold = timestamp - delay.toMillis
+      store.all()
+        .asScala
+        .foreach(result => {
+          val key = result.key
+          val payload = result.value
+          if (payload.timestamp < threshold) { // record is before
+            context.forward(new Record(key, payload.value, timestamp)) // FIXME: what about headers?
+            store.delete(key) // remove from the store, we forwarded it
+          }
+        })
       context.commit()
     })
 
 
   override def process(record: api.Record[Bytes, Bytes]): Unit =
-    store.put(record.key, record.value, record.timestamp)
+    store.put(record.key, ValueAndTimestamp.make(record.value, record.timestamp)) // park the record in the TimestampedKVStore
 
 object DelayRecordProcessor:
   val StoreName = "delayed-records"
